@@ -1,0 +1,258 @@
+version: "3.3"
+
+services:
+  db:
+    image: elestio/postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: posthog
+      POSTGRES_PASSWORD: ${ADMIN_PASSWORD}
+    ports:
+      - 172.17.0.1:8245:5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+    volumes:
+      - ./storage/postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: elestio/redis:7.0
+    restart: always
+    command: redis-server --maxmemory-policy allkeys-lru --maxmemory 200mb
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.6.1.1524
+    restart: always
+    depends_on:
+      - kafka
+      - zookeeper
+    volumes:
+      - ./posthog/posthog/idl:/idl
+      - ./posthog/docker/clickhouse/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+      - ./posthog/docker/clickhouse/config.xml:/etc/clickhouse-server/config.xml
+      - ./posthog/docker/clickhouse/users.xml:/etc/clickhouse-server/users.xml
+      - ./storage/clickhouse-data:/var/lib/clickhouse
+
+  zookeeper:
+    image: zookeeper:3.7.0
+    restart: always
+    volumes:
+      - ./storage/zookeeper-datalog:/datalog
+      - ./storage/zookeeper-data:/data
+      - ./storage/zookeeper-logs:/logs
+
+  kafka:
+    image: bitnami/kafka:2.8.1-debian-10-r99
+    restart: always
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1001
+      KAFKA_CFG_RESERVED_BROKER_MAX_ID: 1001
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      ALLOW_PLAINTEXT_LISTENER: "true"
+
+  worker:
+    image: posthog/posthog:${SOFTWARE_VERSION_TAG}
+    restart: always
+    command: ./bin/docker-worker-celery --with-scheduler
+    environment:
+      SENTRY_DSN: $SENTRY_DSN
+      SITE_URL: https://${DOMAIN}
+      SECRET_KEY: ${POSTHOG_SECRET}
+      DISABLE_SECURE_SSL_REDIRECT: "true"
+      IS_BEHIND_PROXY: "true"
+      TRUST_ALL_PROXIES: "true"
+      DATABASE_URL: "postgres://postgres:${ADMIN_PASSWORD}@db:5432/posthog"
+      CLICKHOUSE_HOST: "clickhouse"
+      CLICKHOUSE_DATABASE: "posthog"
+      CLICKHOUSE_SECURE: "false"
+      CLICKHOUSE_VERIFY: "false"
+      KAFKA_HOSTS: "kafka"
+      REDIS_URL: "redis://redis:6379/"
+      PGHOST: db
+      PGUSER: postgres
+      PGPASSWORD: ${ADMIN_PASSWORD}
+      DEPLOYMENT: hobby
+      EMAIL_HOST: ${EMAIL_HOST}
+      EMAIL_PORT: ${EMAIL_PORT}
+      EMAIL_DEFAULT_FROM: ${EMAIL_DEFAULT_FROM}
+      EMAIL_BACKEND: django.core.mail.backends.smtp.EmailBackend
+    depends_on:
+      - db
+      - redis
+      - clickhouse
+      - kafka
+      - object_storage
+
+  web:
+    image: posthog/posthog:${SOFTWARE_VERSION_TAG}
+    restart: always
+    command: /compose/start
+    volumes:
+      - ./compose:/compose
+    environment:
+      SENTRY_DSN: $SENTRY_DSN
+      SITE_URL: https://${DOMAIN}
+      SECRET_KEY: ${POSTHOG_SECRET}
+      DISABLE_SECURE_SSL_REDIRECT: "true"
+      IS_BEHIND_PROXY: "true"
+      TRUST_ALL_PROXIES: "true"
+      DATABASE_URL: "postgres://postgres:${ADMIN_PASSWORD}@db:5432/posthog"
+      CLICKHOUSE_HOST: "clickhouse"
+      CLICKHOUSE_DATABASE: "posthog"
+      CLICKHOUSE_SECURE: "false"
+      CLICKHOUSE_VERIFY: "false"
+      KAFKA_HOSTS: "kafka"
+      REDIS_URL: "redis://redis:6379/"
+      PGHOST: db
+      PGUSER: postgres
+      PGPASSWORD: ${ADMIN_PASSWORD}
+      DEPLOYMENT: hobby
+      EMAIL_HOST: ${EMAIL_HOST}
+      EMAIL_PORT: ${EMAIL_PORT}
+      EMAIL_DEFAULT_FROM: ${EMAIL_DEFAULT_FROM}
+      EMAIL_BACKEND: django.core.mail.backends.smtp.EmailBackend
+    ports:
+      - 172.17.0.1:9674:8000
+
+  plugins:
+    image: posthog/posthog:${SOFTWARE_VERSION_TAG}
+    restart: always
+    command: ./bin/plugin-server --no-restart-loop
+    environment:
+      SENTRY_DSN: $SENTRY_DSN
+      SITE_URL: https://${DOMAIN}
+      SECRET_KEY: ${POSTHOG_SECRET}
+      DATABASE_URL: "postgres://postgres:${ADMIN_PASSWORD}@db:5432/posthog"
+      KAFKA_HOSTS: "kafka:9092"
+      REDIS_URL: "redis://redis:6379/"
+      CLICKHOUSE_HOST: "clickhouse"
+      CLICKHOUSE_DATABASE: "posthog"
+      CLICKHOUSE_SECURE: "false"
+      CLICKHOUSE_VERIFY: "false"
+      EMAIL_HOST: ${EMAIL_HOST}
+      EMAIL_PORT: ${EMAIL_PORT}
+      EMAIL_DEFAULT_FROM: ${EMAIL_DEFAULT_FROM}
+      EMAIL_BACKEND: django.core.mail.backends.smtp.EmailBackend
+    depends_on:
+      - db
+      - redis
+      - clickhouse
+      - kafka
+      - object_storage
+
+  object_storage:
+    image: elestio/minio:latest
+    restart: always
+    environment:
+      MINIO_ROOT_USER: root
+      MINIO_ROOT_PASSWORD: ${ADMIN_PASSWORD}
+    entrypoint: sh
+    command: -c 'mkdir -p /data/posthog && minio server --address ":19000" --console-address ":19001" /data'
+    volumes:
+      - ./storage/object_storage:/data
+
+  migrate:
+    image: posthog/posthog:${SOFTWARE_VERSION_TAG}
+    restart: always
+    command: sh -c "python manage.py migrate && python manage.py migrate_clickhouse && python manage.py run_async_migrations"
+    deploy:
+      replicas: 0
+
+  asyncmigrationscheck:
+    image: posthog/posthog:${SOFTWARE_VERSION_TAG}
+    restart: "no"
+    command: python manage.py run_async_migrations --check
+    deploy:
+      replicas: 0
+    environment:
+      SENTRY_DSN: $SENTRY_DSN
+      SITE_URL: https://${DOMAIN}
+      SECRET_KEY: ${POSTHOG_SECRET}
+      SKIP_ASYNC_MIGRATIONS_SETUP: 0
+
+  temporal:
+    image: temporalio/auto-setup:1.20.0
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=postgres
+      - POSTGRES_PWD=${ADMIN_PASSWORD}
+      - POSTGRES_SEEDS=db
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+      - ENABLE_ES=false
+      - ES_SEEDS=elasticsearch
+      - ES_VERSION=v7
+    ports:
+      - 7233:7233
+    labels:
+      kompose.volume.type: configMap
+    volumes:
+      - ./posthog/docker/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig
+
+  temporal-admin-tools:
+    image: temporalio/admin-tools:1.20.0
+    restart: always
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_CLI_ADDRESS=temporal:7233
+    stdin_open: true
+    tty: true
+
+  temporal-ui:
+    image: temporalio/ui:2.10.3
+    restart: always
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    ports:
+      - 172.17.0.1:8081:8080
+
+  temporal-django-worker:
+    image: posthog/posthog:${SOFTWARE_VERSION_TAG}
+    restart: always
+    command: /compose/temporal-django-worker
+    environment:
+      SENTRY_DSN: $SENTRY_DSN
+      SITE_URL: https://${DOMAIN}
+      TEMPORAL_HOST: temporal
+      SECRET_KEY: ${POSTHOG_SECRET}
+      EMAIL_HOST: ${EMAIL_HOST}
+      EMAIL_PORT: ${EMAIL_PORT}
+      EMAIL_DEFAULT_FROM: ${EMAIL_DEFAULT_FROM}
+      EMAIL_BACKEND: django.core.mail.backends.smtp.EmailBackend
+      DATABASE_URL: "postgres://postgres:${ADMIN_PASSWORD}@db:5432/posthog"
+      REDIS_URL: "redis://redis:6379/"
+    volumes:
+      - ./compose:/compose
+    depends_on:
+      - db
+      - redis
+      - clickhouse
+      - kafka
+      - object_storage
+      - temporal
+
+  pgadmin4:
+    image: dpage/pgadmin4:${SOFTWARE_VERSION_TAG}
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${ADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${ADMIN_PASSWORD}
+      PGADMIN_LISTEN_PORT: 8080
+    ports:
+      - "172.17.0.1:2875:8080"
+    volumes:
+      - ./servers.json:/pgadmin4/servers.json
